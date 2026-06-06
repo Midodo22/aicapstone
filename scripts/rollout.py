@@ -515,10 +515,11 @@ def main():
     )
 
     rate_limiter = RateLimiter(args_cli.step_hz)
-    controller = Controller()
-    controller.reset()
-
-    setup_dual_viewports()
+    controller = None
+    if not args_cli.headless:
+        controller = Controller()
+        controller.reset()
+        setup_dual_viewports()
 
 
     success_count, episode_count = 0, 1
@@ -527,7 +528,7 @@ def main():
         success, time_out = False, False
         while simulation_app.is_running():
             with torch.inference_mode():
-                if controller.reset_state:
+                if controller is not None and controller.reset_state:
                     controller.reset()
                     obs_dict, _ = env.reset()
                     policy.reset()
