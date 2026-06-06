@@ -108,6 +108,7 @@ launch-isaaclab-glowsai-4090: build-isaaclab
 		--ulimit memlock=-1 \
 		--ulimit stack=67108864 \
 		--shm-size=16g \
+		-d \
 		-v $(shell pwd):/workspace/aicapstone \
 		-v /workspace/aicapstone/.venv \
 		-v /home/glows/.Xauthority:/root/.Xauthority:ro \
