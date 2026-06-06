@@ -11,8 +11,9 @@ Usage:
     python scripts/datagen/generate.py \
         --task HCIS-CupStacking-SingleArm-v0 \
         --num_envs 1 --device cuda --enable_cameras \
-        --record --dataset_file ./datasets/cup_stacking.hdf5 \
-        --object_poses datasets/0210_kitchen/demos/mapping/object_poses.json
+        --record --use_lerobot_recorder \
+        --lerobot_dataset_repo_id MidoriChou/ai_final_3 \
+        --object_poses data/ai_final_3/object_poses.json
 """
 
 import multiprocessing
@@ -21,7 +22,10 @@ if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
 
 import argparse
+import json
+import math
 import os
+import random
 import signal
 import time
 
@@ -34,19 +38,105 @@ parser.add_argument("--seed", type=int, default=None, help="Seed for the environ
 parser.add_argument("--record", action="store_true", help="Whether to enable record function.")
 parser.add_argument("--step_hz", type=int, default=60, help="Environment stepping rate in Hz.")
 parser.add_argument(
-    "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
+    "--dataset_file",
+    type=str,
+    default="./datasets/dataset.hdf5",
+    help="HDF5 output path used only when --use_lerobot_recorder is not set.",
 )
 parser.add_argument("--resume", action="store_true", help="Whether to resume recording in the existing dataset file.")
+parser.add_argument(
+    "--target_demo_count",
+    type=int,
+    default=None,
+    help=(
+        "Total number of successful demos to keep generating until. With --resume, "
+        "existing demos in the selected recorder dataset are counted and new demos are appended."
+    ),
+)
 parser.add_argument(
     "--object_poses",
     type=str,
     required=True,
     help="Path to the per-episode object_poses.json (UMI schema). Episode count = number of status=='full' entries.",
 )
+parser.add_argument(
+    "--samples_per_pose",
+    type=int,
+    default=1,
+    help="Number of randomized trajectories to generate from each object_poses entry, starting at entry 0.",
+)
+parser.add_argument(
+    "--pose_jitter_xy",
+    type=float,
+    default=0.0,
+    help="Uniform random x/y jitter in meters applied independently to each object pose.",
+)
+parser.add_argument(
+    "--pose_jitter_yaw_deg",
+    type=float,
+    default=0.0,
+    help="Uniform random yaw jitter in degrees applied independently to each object pose.",
+)
+parser.add_argument(
+    "--min_cup_distance",
+    type=float,
+    default=0.08,
+    help="Minimum initial xy distance between blue_cup and pink_cup after jitter.",
+)
+parser.add_argument(
+    "--max_cup_distance",
+    type=float,
+    default=0.20,
+    help="Maximum initial xy distance between blue_cup and pink_cup after jitter.",
+)
+parser.add_argument(
+    "--cup_workspace_x_range",
+    type=float,
+    nargs=2,
+    default=(0.35, 0.55),
+    metavar=("MIN", "MAX"),
+    help="Allowed world x range for cup initial poses after jitter.",
+)
+parser.add_argument(
+    "--cup_workspace_y_range",
+    type=float,
+    nargs=2,
+    default=(-0.36, -0.16),
+    metavar=("MIN", "MAX"),
+    help="Allowed world y range for cup initial poses after jitter.",
+)
+parser.add_argument(
+    "--disable_cup_workspace_clamp",
+    action="store_true",
+    help="Disable cup workspace regularization and use raw object_poses+jitter positions.",
+)
+parser.add_argument(
+    "--cup_pair_flip_prob",
+    type=float,
+    default=0.5,
+    help=(
+        "Probability of flipping the blue/pink relative layout around their midpoint after jitter. "
+        "Use 0 to preserve object_poses ordering."
+    ),
+)
+parser.add_argument(
+    "--sample_cup_layout",
+    action="store_true",
+    help="Sample cup center, distance, and angle uniformly inside the safe workspace instead of clamping raw poses.",
+)
 parser.add_argument("--quality", action="store_true", help="Whether to enable quality render mode.")
 parser.add_argument("--use_lerobot_recorder", action="store_true", help="Whether to use lerobot recorder.")
 parser.add_argument("--lerobot_dataset_repo_id", type=str, default=None, help="Lerobot Dataset repository ID.")
 parser.add_argument("--lerobot_dataset_fps", type=int, default=30, help="Lerobot Dataset frames per second.")
+parser.add_argument(
+    "--lerobot_dataset_local_dir",
+    type=str,
+    default=None,
+    help=(
+        "Local LeRobot dataset directory used to count existing episodes when resuming. "
+        "Defaults to ./data/<repo_name> for repo ids like user/repo."
+    ),
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -121,6 +211,16 @@ def auto_terminate(env: ManagerBasedRLEnv | DirectRLEnv, success: bool):
         env.cfg.return_success_status = success
 
 
+def _get_dataset_export_mode(args_cli):
+    if args_cli.use_lerobot_recorder:
+        if args_cli.resume:
+            return EnhanceDatasetExportMode.EXPORT_SUCCEEDED_ONLY_RESUME
+        return DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+    if args_cli.resume:
+        return EnhanceDatasetExportMode.EXPORT_ALL_RESUME
+    return DatasetExportMode.EXPORT_ALL
+
+
 def _configure_env_cfg(env_cfg, args_cli, is_direct_env, output_dir, output_file_name):
     """Configure termination and recorder settings on env_cfg."""
     if is_direct_env:
@@ -134,23 +234,23 @@ def _configure_env_cfg(env_cfg, args_cli, is_direct_env, output_dir, output_file
 
     if args_cli.record:
         if args_cli.use_lerobot_recorder:
-            if args_cli.resume:
-                env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_SUCCEEDED_ONLY_RESUME
-            else:
-                env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+            # The default IsaacLab RecorderManager is constructed during gym.make.
+            # Keep recorder terms active, but suppress its HDF5 file handler until
+            # we replace it with LeRobotRecorderManager after env creation.
+            env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_NONE
         else:
             if args_cli.resume:
-                env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_ALL_RESUME
+                env_cfg.recorders.dataset_export_mode = _get_dataset_export_mode(args_cli)
                 assert os.path.exists(
                     args_cli.dataset_file
                 ), "the dataset file does not exist, please don't use '--resume' if you want to record a new dataset"
             else:
-                env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_ALL
+                env_cfg.recorders.dataset_export_mode = _get_dataset_export_mode(args_cli)
                 assert not os.path.exists(
                     args_cli.dataset_file
                 ), "the dataset file already exists, please use '--resume' to resume recording"
-        env_cfg.recorders.dataset_export_dir_path = output_dir
-        env_cfg.recorders.dataset_filename = output_file_name
+            env_cfg.recorders.dataset_export_dir_path = output_dir
+            env_cfg.recorders.dataset_filename = output_file_name
         if is_direct_env:
             env_cfg.return_success_status = False
         else:
@@ -176,6 +276,7 @@ def _replace_recorder_manager(env, env_cfg, args_cli):
             repo_id=args_cli.lerobot_dataset_repo_id,
             fps=args_cli.lerobot_dataset_fps,
         )
+        env_cfg.recorders.dataset_export_mode = _get_dataset_export_mode(args_cli)
         env.recorder_manager = LeRobotRecorderManager(env_cfg.recorders, dataset_cfg, env)
     else:
         env.recorder_manager = StreamingRecorderManager(env_cfg.recorders, env)
@@ -183,9 +284,207 @@ def _replace_recorder_manager(env, env_cfg, args_cli):
         env.recorder_manager.compression = "lzf"
 
 
-def _apply_episode_poses(env, poses):
+def _resolve_lerobot_dataset_dir(args_cli):
+    """Return the local LeRobot dataset directory used by lerobot-train, if present."""
+    if args_cli.lerobot_dataset_local_dir:
+        return args_cli.lerobot_dataset_local_dir
+    if not args_cli.lerobot_dataset_repo_id:
+        return None
+    repo_name = args_cli.lerobot_dataset_repo_id.rsplit("/", 1)[-1]
+    candidates = [
+        os.path.join("data", repo_name),
+        args_cli.lerobot_dataset_repo_id,
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _get_lerobot_episode_count(args_cli):
+    dataset_dir = _resolve_lerobot_dataset_dir(args_cli)
+    if not dataset_dir:
+        return 0
+    info_path = os.path.join(dataset_dir, "meta", "info.json")
+    if not os.path.exists(info_path):
+        return 0
+    with open(info_path) as f:
+        info = json.load(f)
+    return int(info.get("total_episodes", 0))
+
+
+def _get_resume_recorded_demo_count(env, args_cli):
+    if args_cli.use_lerobot_recorder:
+        count = _get_lerobot_episode_count(args_cli)
+        dataset_dir = _resolve_lerobot_dataset_dir(args_cli)
+        print(f"Resume recording from LeRobot dataset {dataset_dir} with {count} demonstrations.")
+        return count
+    count = env.recorder_manager._dataset_file_handler.get_num_episodes()
+    print(f"Resume recording from existing HDF5 dataset file with {count} demonstrations.")
+    return count
+
+
+def _get_exported_successful_episode_count(env):
+    return getattr(env.recorder_manager, "exported_successful_episode_count", 0)
+
+
+def _ensure_physics_sim_view(env):
+    """Ensure PhysX tensor views exist before robot/object handles are touched."""
+    from isaacsim.core.simulation_manager import SimulationManager
+
+    if SimulationManager.get_physics_sim_view() is not None:
+        return
+
+    print("[INFO] PhysX simulation view is not ready; resetting simulator before manager setup.")
+    env.sim.reset()
+    env.scene.update(dt=env.physics_dt)
+    if not hasattr(env, "recorder_manager"):
+        env.load_managers()
+
+
+def _quat_with_yaw_delta(quat, yaw_delta):
+    """Apply a world-z yaw delta to a wxyz quaternion."""
+    half_yaw = 0.5 * yaw_delta
+    yaw_quat = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+    w1, x1, y1, z1 = yaw_quat
+    w2, x2, y2, z2 = quat
+    return (
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    )
+
+
+def _jitter_episode_poses(
+    poses,
+    rng,
+    args_cli,
+    xy_jitter: float,
+    yaw_jitter_rad: float,
+    min_cup_distance: float,
+):
+    """Return a jittered copy of episode poses without mutating the source."""
+    jittered = {}
+    for name, (pos, quat) in poses.items():
+        dx = rng.uniform(-xy_jitter, xy_jitter) if xy_jitter > 0.0 else 0.0
+        dy = rng.uniform(-xy_jitter, xy_jitter) if xy_jitter > 0.0 else 0.0
+        dyaw = rng.uniform(-yaw_jitter_rad, yaw_jitter_rad) if yaw_jitter_rad > 0.0 else 0.0
+        jittered[name] = (
+            (pos[0] + dx, pos[1] + dy, pos[2]),
+            _quat_with_yaw_delta(quat, dyaw) if dyaw != 0.0 else quat,
+        )
+
+    if "blue_cup" not in jittered or "pink_cup" not in jittered:
+        return jittered
+
+    if not args_cli.disable_cup_workspace_clamp:
+        jittered = _regularize_cup_stacking_poses(jittered, rng, args_cli)
+
+    if min_cup_distance <= 0.0:
+        return jittered
+
+    blue_pos = jittered["blue_cup"][0]
+    pink_pos = jittered["pink_cup"][0]
+    cup_distance = math.hypot(blue_pos[0] - pink_pos[0], blue_pos[1] - pink_pos[1])
+    if cup_distance >= min_cup_distance:
+        return jittered
+
+    # If independent jitter makes the cups too close, push them apart along their
+    # current separation direction while preserving the sampled midpoint.
+    if cup_distance < 1e-6:
+        ux, uy = 1.0, 0.0
+    else:
+        ux = (blue_pos[0] - pink_pos[0]) / cup_distance
+        uy = (blue_pos[1] - pink_pos[1]) / cup_distance
+    mid_x = 0.5 * (blue_pos[0] + pink_pos[0])
+    mid_y = 0.5 * (blue_pos[1] + pink_pos[1])
+    half_distance = 0.5 * min_cup_distance
+
+    blue_quat = jittered["blue_cup"][1]
+    pink_quat = jittered["pink_cup"][1]
+    jittered["blue_cup"] = (
+        (mid_x + ux * half_distance, mid_y + uy * half_distance, blue_pos[2]),
+        blue_quat,
+    )
+    jittered["pink_cup"] = (
+        (mid_x - ux * half_distance, mid_y - uy * half_distance, pink_pos[2]),
+        pink_quat,
+    )
+    return jittered
+
+
+def _regularize_cup_stacking_poses(poses, rng, args_cli):
+    """Keep cup starts in the reliable workspace of the scripted IK policy."""
+    blue_pos, blue_quat = poses["blue_cup"]
+    pink_pos, pink_quat = poses["pink_cup"]
+    x_min, x_max = args_cli.cup_workspace_x_range
+    y_min, y_max = args_cli.cup_workspace_y_range
+    min_distance = max(args_cli.min_cup_distance, 0.0)
+    max_distance = max(args_cli.max_cup_distance, min_distance)
+
+    if args_cli.sample_cup_layout:
+        for _ in range(100):
+            angle = rng.uniform(-math.pi, math.pi)
+            ux, uy = math.cos(angle), math.sin(angle)
+            distance = rng.uniform(min_distance, max_distance)
+            half_dx = 0.5 * distance * ux
+            half_dy = 0.5 * distance * uy
+            if x_min + abs(half_dx) <= x_max - abs(half_dx) and y_min + abs(half_dy) <= y_max - abs(half_dy):
+                break
+        else:
+            raise ValueError("Unable to sample cup layout inside workspace; reduce --max_cup_distance or widen ranges.")
+    else:
+        dx = blue_pos[0] - pink_pos[0]
+        dy = blue_pos[1] - pink_pos[1]
+        distance = math.hypot(dx, dy)
+        if distance < 1e-6:
+            angle = rng.uniform(-math.pi, math.pi)
+            ux, uy = math.cos(angle), math.sin(angle)
+        else:
+            ux, uy = dx / distance, dy / distance
+        should_flip = rng.random() < args_cli.cup_pair_flip_prob
+        if should_flip:
+            print("[pose] flipped blue/pink relative layout")
+            ux, uy = -ux, -uy
+        distance = min(max(distance, min_distance), max_distance)
+        half_dx = 0.5 * distance * ux
+        half_dy = 0.5 * distance * uy
+
+    center_x_min = x_min + abs(half_dx)
+    center_x_max = x_max - abs(half_dx)
+    center_y_min = y_min + abs(half_dy)
+    center_y_max = y_max - abs(half_dy)
+    if args_cli.sample_cup_layout:
+        center_x = rng.uniform(center_x_min, center_x_max)
+        center_y = rng.uniform(center_y_min, center_y_max)
+        print(
+            "[pose] sampled cup layout "
+            f"center=({center_x:.3f}, {center_y:.3f}) distance={distance:.3f}"
+        )
+    else:
+        center_x = 0.5 * (blue_pos[0] + pink_pos[0])
+        center_y = 0.5 * (blue_pos[1] + pink_pos[1])
+        center_x = min(max(center_x, center_x_min), center_x_max)
+        center_y = min(max(center_y, center_y_min), center_y_max)
+
+    regularized = dict(poses)
+    regularized["blue_cup"] = ((center_x + half_dx, center_y + half_dy, blue_pos[2]), blue_quat)
+    regularized["pink_cup"] = ((center_x - half_dx, center_y - half_dy, pink_pos[2]), pink_quat)
+    return regularized
+
+
+def _apply_episode_poses(env, poses, args_cli, episode_seed: int):
     """Write per-object root poses for the current episode into the sim."""
-    import math as _math
+    rng = random.Random(episode_seed)
+    poses = _jitter_episode_poses(
+        poses,
+        rng,
+        args_cli,
+        args_cli.pose_jitter_xy,
+        math.radians(args_cli.pose_jitter_yaw_deg),
+        args_cli.min_cup_distance,
+    )
 
     device = env.device
     for name, (pos, quat) in poses.items():
@@ -197,11 +496,45 @@ def _apply_episode_poses(env, poses):
         ).repeat(env.num_envs, 1)
         obj.write_root_pose_to_sim(pose_tensor)
         w, x, y, z = quat
-        yaw_deg = _math.degrees(_math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+        yaw_deg = math.degrees(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
         print(
             f"  [pose] {name}: pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) "
             f"yaw={yaw_deg:+6.1f}°"
         )
+
+
+def _should_stop_generating(
+    args_cli,
+    current_recorded_demo_count: int,
+    attempted_episode_count: int,
+    total_episodes: int,
+):
+    if args_cli.record and args_cli.target_demo_count is not None:
+        return current_recorded_demo_count >= args_cli.target_demo_count
+    return attempted_episode_count >= total_episodes
+
+
+def _progress_counts(
+    args_cli,
+    current_recorded_demo_count: int,
+    attempted_episode_count: int,
+    total_episodes: int,
+):
+    if args_cli.record and args_cli.target_demo_count is not None:
+        return current_recorded_demo_count, args_cli.target_demo_count
+    return min(attempted_episode_count, total_episodes), total_episodes
+
+
+def _planned_pose_attempt_count(args_cli, pose_count: int) -> int:
+    return pose_count * args_cli.samples_per_pose
+
+
+def _pose_idx_for_attempt(args_cli, attempted_episode_count: int, pose_count: int) -> int:
+    return (attempted_episode_count // args_cli.samples_per_pose) % pose_count
+
+
+def _pose_sample_idx_for_attempt(args_cli, attempted_episode_count: int) -> int:
+    return attempted_episode_count % args_cli.samples_per_pose
 
 
 # z below which a task object is considered to have fallen off the table.
@@ -221,21 +554,56 @@ def _any_object_fell(env, object_names, z_threshold: float) -> bool:
     return False
 
 
+def _print_episode_diagnostics(env, label: str):
+    """Print task-specific final state for success/failure inspection."""
+    try:
+        blue_cup = env.scene["blue_cup"]
+        pink_cup = env.scene["pink_cup"]
+    except KeyError:
+        return
+
+    blue_pos = (blue_cup.data.root_pos_w - env.scene.env_origins)[0]
+    pink_pos = (pink_cup.data.root_pos_w - env.scene.env_origins)[0]
+    dx = blue_pos[0] - pink_pos[0]
+    dy = blue_pos[1] - pink_pos[1]
+    dz = blue_pos[2] - pink_pos[2]
+    xy_dist = torch.linalg.norm(torch.stack((dx, dy))).item()
+    print(
+        f"[{label} Debug] blue-pink "
+        f"dx={dx.item():+.3f} dy={dy.item():+.3f} dz={dz.item():+.3f} "
+        f"xy_dist={xy_dist:.3f}"
+    )
+    print(
+        f"[{label} Debug] final poses "
+        f"blue=({blue_pos[0].item():.3f}, {blue_pos[1].item():.3f}, {blue_pos[2].item():.3f}) "
+        f"pink=({pink_pos[0].item():.3f}, {pink_pos[1].item():.3f}, {pink_pos[2].item():.3f})"
+    )
+    if label == "Fail":
+        print(
+            "[Fail Debug] success requires "
+            "|dx|<0.050, |dy|<0.050, dz>0.100, and no task object below z=0.000"
+        )
+        if blue_pos[2].item() < _FALL_THRESHOLD_Z or pink_pos[2].item() < _FALL_THRESHOLD_Z:
+            print("[Fail Debug] at least one cup is below the table threshold.")
+
+
 def _on_episode_done(
     env,
     sm,
     args_cli,
     episodes,
-    next_episode_idx,
+    next_pose_idx,
+    attempted_episode_count,
+    episode_seed_base,
     resume_recorded_demo_count,
     current_recorded_demo_count,
     start_record_state,
 ):
     """Handle end-of-episode logic.
 
-    Returns (next_episode_idx, current_recorded_demo_count, start_record_state, should_break).
+    Returns (next_pose_idx, attempted_episode_count, current_recorded_demo_count, start_record_state, should_break).
     """
-    total_episodes = len(episodes)
+    total_episodes = _planned_pose_attempt_count(args_cli, len(episodes))
 
     try:
         success = sm.check_success(env)
@@ -244,6 +612,7 @@ def _on_episode_done(
         success = False
 
     print("Episode success!" if success else "Episode failed!")
+    _print_episode_diagnostics(env, "Success" if success else "Fail")
 
     if start_record_state:
         if args_cli.record:
@@ -258,25 +627,34 @@ def _on_episode_done(
 
     if (
         args_cli.record
-        and env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
+        and _get_exported_successful_episode_count(env) + resume_recorded_demo_count
         > current_recorded_demo_count
     ):
         current_recorded_demo_count = (
-            env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
+            _get_exported_successful_episode_count(env) + resume_recorded_demo_count
         )
         print(f"Recorded {current_recorded_demo_count} successful demonstrations.")
 
-    if next_episode_idx >= total_episodes:
-        print(f"Replayed all {total_episodes} episodes. Exiting the app.")
-        return next_episode_idx, current_recorded_demo_count, start_record_state, True, success
+    if _should_stop_generating(args_cli, current_recorded_demo_count, attempted_episode_count, total_episodes):
+        if args_cli.record and args_cli.target_demo_count is not None:
+            print(f"Reached target demo count {args_cli.target_demo_count}. Exiting the app.")
+        else:
+            print(f"Replayed all {total_episodes} pose attempts. Exiting the app.")
+        return next_pose_idx, attempted_episode_count, current_recorded_demo_count, start_record_state, True, success
 
     env.reset()
     sm.reset()
     auto_terminate(env, False)
-    _apply_episode_poses(env, episodes[next_episode_idx])
-    next_episode_idx += 1
+    next_pose_idx = _pose_idx_for_attempt(args_cli, attempted_episode_count, len(episodes))
+    next_sample_idx = _pose_sample_idx_for_attempt(args_cli, attempted_episode_count)
+    print(
+        f"[pose] using object_poses[{next_pose_idx}] "
+        f"sample {next_sample_idx + 1}/{args_cli.samples_per_pose}"
+    )
+    _apply_episode_poses(env, episodes[next_pose_idx], args_cli, episode_seed_base + attempted_episode_count)
+    attempted_episode_count += 1
 
-    return next_episode_idx, current_recorded_demo_count, start_record_state, False, success
+    return next_pose_idx, attempted_episode_count, current_recorded_demo_count, start_record_state, False, success
 
 
 def main():
@@ -288,8 +666,14 @@ def main():
         )
     SMClass, device = TASK_REGISTRY[task_name]
 
-    output_dir = os.path.dirname(args_cli.dataset_file)
-    output_file_name = os.path.splitext(os.path.basename(args_cli.dataset_file))[0]
+    if args_cli.use_lerobot_recorder:
+        if not args_cli.lerobot_dataset_repo_id:
+            raise ValueError("--use_lerobot_recorder requires --lerobot_dataset_repo_id.")
+        output_dir = ""
+        output_file_name = "unused_lerobot_dataset"
+    else:
+        output_dir = os.path.dirname(args_cli.dataset_file)
+        output_file_name = os.path.splitext(os.path.basename(args_cli.dataset_file))[0]
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -308,11 +692,37 @@ def main():
             f"No 'status==full' episodes in {args_cli.object_poses}; nothing to replay."
         )
     print(f"Loaded {len(episodes)} replay episodes from {args_cli.object_poses}")
+    if args_cli.target_demo_count is not None and args_cli.target_demo_count <= 0:
+        raise ValueError("--target_demo_count must be a positive integer when provided.")
+    if args_cli.target_demo_count is not None and not args_cli.record:
+        raise ValueError("--target_demo_count counts recorded successful demos, so it requires --record.")
+    if args_cli.samples_per_pose <= 0:
+        raise ValueError("--samples_per_pose must be a positive integer.")
+    if args_cli.pose_jitter_xy < 0.0:
+        raise ValueError("--pose_jitter_xy must be >= 0.")
+    if args_cli.pose_jitter_yaw_deg < 0.0:
+        raise ValueError("--pose_jitter_yaw_deg must be >= 0.")
+    if args_cli.min_cup_distance < 0.0:
+        raise ValueError("--min_cup_distance must be >= 0.")
+    if args_cli.max_cup_distance < args_cli.min_cup_distance:
+        raise ValueError("--max_cup_distance must be >= --min_cup_distance.")
+    if args_cli.cup_workspace_x_range[0] >= args_cli.cup_workspace_x_range[1]:
+        raise ValueError("--cup_workspace_x_range MIN must be less than MAX.")
+    if args_cli.cup_workspace_y_range[0] >= args_cli.cup_workspace_y_range[1]:
+        raise ValueError("--cup_workspace_y_range MIN must be less than MAX.")
+    if not 0.0 <= args_cli.cup_pair_flip_prob <= 1.0:
+        raise ValueError("--cup_pair_flip_prob must be in [0, 1].")
+    if args_cli.sample_cup_layout:
+        workspace_width = args_cli.cup_workspace_x_range[1] - args_cli.cup_workspace_x_range[0]
+        workspace_depth = args_cli.cup_workspace_y_range[1] - args_cli.cup_workspace_y_range[0]
+        if max(workspace_width, workspace_depth) < args_cli.min_cup_distance:
+            raise ValueError("--sample_cup_layout workspace is too small for --min_cup_distance.")
 
     is_direct_env = "Direct" in task_name
     _configure_env_cfg(env_cfg, args_cli, is_direct_env, output_dir, output_file_name)
 
     env: ManagerBasedRLEnv | DirectRLEnv = gym.make(task_name, cfg=env_cfg).unwrapped
+    _ensure_physics_sim_view(env)
 
     # disable gravity for every robot link prim
     import omni.usd
@@ -323,7 +733,7 @@ def main():
         if "Robot" in str(_prim.GetPath()) and _prim.HasAPI(UsdPhysics.RigidBodyAPI):
             PhysxSchema.PhysxRigidBodyAPI.Apply(_prim).CreateDisableGravityAttr(True)
 
-    if args_cli.record:
+    if args_cli.record and not args_cli.use_lerobot_recorder:
         _replace_recorder_manager(env, env_cfg, args_cli)
 
     rate_limiter = RateLimiter(args_cli.step_hz)
@@ -337,22 +747,39 @@ def main():
     env.reset()
     sm.reset()
 
+    if args_cli.record and args_cli.use_lerobot_recorder:
+        _replace_recorder_manager(env, env_cfg, args_cli)
+
     fall_check_object_names = tuple(getattr(sm, "task_object_names", ()))
 
     resume_recorded_demo_count = 0
     if args_cli.record and args_cli.resume:
-        resume_recorded_demo_count = env.recorder_manager._dataset_file_handler.get_num_episodes()
-        print(f"Resume recording from existing dataset file with {resume_recorded_demo_count} demonstrations.")
+        resume_recorded_demo_count = _get_resume_recorded_demo_count(env, args_cli)
     current_recorded_demo_count = resume_recorded_demo_count
 
-    next_episode_idx = min(resume_recorded_demo_count, len(episodes))
-    if next_episode_idx >= len(episodes):
-        print(f"Resume count {next_episode_idx} ≥ total episodes {len(episodes)}; nothing to do.")
+    if (
+        args_cli.record
+        and args_cli.target_demo_count is not None
+        and current_recorded_demo_count >= args_cli.target_demo_count
+    ):
+        print(
+            f"Existing dataset already has {current_recorded_demo_count} demonstrations, "
+            f"which meets target {args_cli.target_demo_count}. Nothing to do."
+        )
         env.close()
         simulation_app.close()
         return
-    _apply_episode_poses(env, episodes[next_episode_idx])
-    next_episode_idx += 1
+
+    episode_seed_base = int(env_cfg.seed)
+    attempted_episode_count = 0
+    next_pose_idx = _pose_idx_for_attempt(args_cli, attempted_episode_count, len(episodes))
+    next_sample_idx = _pose_sample_idx_for_attempt(args_cli, attempted_episode_count)
+    print(
+        f"[pose] using object_poses[{next_pose_idx}] "
+        f"sample {next_sample_idx + 1}/{args_cli.samples_per_pose}"
+    )
+    _apply_episode_poses(env, episodes[next_pose_idx], args_cli, episode_seed_base + attempted_episode_count)
+    attempted_episode_count += 1
 
     start_record_state = False
     interrupted = False
@@ -374,7 +801,8 @@ def main():
 
                 if sm.is_episode_done:
                     (
-                        next_episode_idx,
+                        next_pose_idx,
+                        attempted_episode_count,
                         current_recorded_demo_count,
                         start_record_state,
                         should_break,
@@ -384,17 +812,31 @@ def main():
                         sm,
                         args_cli,
                         episodes,
-                        next_episode_idx,
+                        next_pose_idx,
+                        attempted_episode_count,
+                        episode_seed_base,
                         resume_recorded_demo_count,
                         current_recorded_demo_count,
                         start_record_state,
                     )
                     if success:
-                        print(f"\033[92m[Data Usage]{cnt}/{len(episodes)} success.\033[0m")
+                        progress_count, progress_total = _progress_counts(
+                            args_cli,
+                            current_recorded_demo_count,
+                            attempted_episode_count,
+                            _planned_pose_attempt_count(args_cli, len(episodes)),
+                        )
+                        print(f"\033[92m[Data Usage]{progress_count}/{progress_total} success.\033[0m")
                         success_ID.append(cnt)
                         cnt += 1
                     else:
-                        print(f"\033[91m[Data Usage]{cnt}/{len(episodes)} fail.\033[0m")
+                        progress_count, progress_total = _progress_counts(
+                            args_cli,
+                            current_recorded_demo_count,
+                            attempted_episode_count,
+                            _planned_pose_attempt_count(args_cli, len(episodes)),
+                        )
+                        print(f"\033[91m[Data Usage]{progress_count}/{progress_total} fail.\033[0m")
                     if should_break:
                         break
                 else:
