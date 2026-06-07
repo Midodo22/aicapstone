@@ -43,12 +43,14 @@ _HOVER_Z_OFFSET = 0.15
 _GRASP_Z_OFFSET = 0.08
 _LIFT_Z_OFFSET = 0.2
 _RELEASE_Z_OFFSET = 0.09
+_STACK_SUCCESS_MARGIN = 0.015
 _GRIPPER_DOWN_ROLL_W = math.pi
 _GRIPPER_DOWN_PITCH_W = 0.0
 _GRIPPER_DOWN_YAW_OFFSET_RANGE = (-0.15, 0.15)
 
 _SUCCESS_X_RANGE = (-0.05, 0.05)
 _SUCCESS_Y_RANGE = (-0.05, 0.05)
+_SUCCESS_HEIGHT_THRESHOLD = 0.10
 
 _FRANKA_REST_JOINT_POS = {
     "panda_joint1": 0.0,
@@ -129,13 +131,13 @@ class CupStackingStateMachine(StateMachineBase):
         self._gripper_down_yaw_offset_w: torch.Tensor | None = None
         self._event: int = 0
         self._events_dt = [
-            160,  # Phase 0: Move above the blue cup
-            80,  # Phase 1: Approach down to the blue cup
-            20,  # Phase 2: Close gripper to grasp
-            100,  # Phase 3: Lift blue cup upward
-            85,  # Phase 4: Move blue cup above the pink cup
-            35,  # Phase 5: Lower/place and release
-            30,  # Phase 6: Move up and away
+            350,  # Phase 0: Move above the blue cup
+            160,  # Phase 1: Approach down to the blue cup
+            60,  # Phase 2: Close gripper to grasp
+            200,  # Phase 3: Lift blue cup upward
+            210,  # Phase 4: Move blue cup above the pink cup
+            120,  # Phase 5: Lower/place above the pink cup
+            100,  # Phase 6: Hold the eval-success stack pose
         ]
 
     # ------------------------------------------------------------------
@@ -186,6 +188,7 @@ class CupStackingStateMachine(StateMachineBase):
         done = torch.logical_and(done, blue_cup_pos[:, 0] > pink_cup_pos[:, 0] + _SUCCESS_X_RANGE[0])
         done = torch.logical_and(done, blue_cup_pos[:, 1] < pink_cup_pos[:, 1] + _SUCCESS_Y_RANGE[1])
         done = torch.logical_and(done, blue_cup_pos[:, 1] > pink_cup_pos[:, 1] + _SUCCESS_Y_RANGE[0])
+        done = torch.logical_and(done, blue_cup_pos[:, 2] > pink_cup_pos[:, 2] + _SUCCESS_HEIGHT_THRESHOLD)
         return bool(done.all().item())
 
     def pre_step(self, env) -> None:
@@ -220,7 +223,9 @@ class CupStackingStateMachine(StateMachineBase):
         elif self._event == 5:
             target_pos_w, gripper_cmd = self._phase_lower_to_release(pink_cup_pos_w, num_envs, device)
         else:
-            target_pos_w, gripper_cmd = self._phase_lift_away(pink_cup_pos_w, num_envs, device)
+            target_pos_w, gripper_cmd = self._phase_hold_stack_pose(
+                robot, blue_cup_pos_w, pink_cup_pos_w, num_envs, device
+            )
 
         return self._joint_position_franka_action(env, target_pos_w, target_quat_w, gripper_cmd)
 
@@ -255,6 +260,13 @@ class CupStackingStateMachine(StateMachineBase):
     def _phase_lower_to_release(self, pink_cup_pos_w, num_envs, device):
         target_pos_w = pink_cup_pos_w.clone()
         target_pos_w[:, 2] += _RELEASE_Z_OFFSET
+        return target_pos_w, _constant_gripper(num_envs, device, _GRIPPER_CLOSE)
+
+    def _phase_hold_stack_pose(self, robot, blue_cup_pos_w, pink_cup_pos_w, num_envs, device):
+        target_blue_pos_w = pink_cup_pos_w.clone()
+        target_blue_pos_w[:, 2] += _SUCCESS_HEIGHT_THRESHOLD + _STACK_SUCCESS_MARGIN
+        blue_error_w = target_blue_pos_w - blue_cup_pos_w
+        target_pos_w = self._ee_pos_w(robot).clone() + blue_error_w
         return target_pos_w, _constant_gripper(num_envs, device, _GRIPPER_CLOSE)
 
     def _phase_lift_away(self, pink_cup_pos_w, num_envs, device):
