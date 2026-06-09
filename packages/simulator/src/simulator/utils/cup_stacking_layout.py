@@ -30,6 +30,17 @@ class UniformXYSpawn:
         y = self.center[1] + rng.uniform(*self.y_offset)
         return ((x, y, self.center[2]), self.quat_wxyz)
 
+    def expanded_xy(self, margin: float) -> UniformXYSpawn:
+        """Return the spawn range expanded by ``margin`` on every xy edge."""
+        if margin < 0.0:
+            raise ValueError("XY expansion margin must be non-negative.")
+        return UniformXYSpawn(
+            center=self.center,
+            x_offset=(self.x_offset[0] - margin, self.x_offset[1] + margin),
+            y_offset=(self.y_offset[0] - margin, self.y_offset[1] + margin),
+            quat_wxyz=self.quat_wxyz,
+        )
+
 
 # Mirrors eval/cup_stacking_eval.py without importing or modifying the private
 # evaluation config. The eval reset event independently adds +/- 5 cm to each
@@ -47,7 +58,26 @@ CUP_STACKING_EVAL_SPAWNS: dict[str, UniformXYSpawn] = {
     ),
 }
 
+CUP_STACKING_EVAL_WIDE_MARGIN = 0.02
+CUP_STACKING_EVAL_WIDE_SPAWNS: dict[str, UniformXYSpawn] = {
+    name: spawn.expanded_xy(CUP_STACKING_EVAL_WIDE_MARGIN)
+    for name, spawn in CUP_STACKING_EVAL_SPAWNS.items()
+}
+
+
+def sample_cup_stacking_layout(
+    rng: random.Random,
+    spawns: dict[str, UniformXYSpawn],
+) -> dict[str, WorldPose]:
+    """Sample independent cup positions from the selected spawn distribution."""
+    return {name: spawn.sample(rng) for name, spawn in spawns.items()}
+
 
 def sample_cup_stacking_eval_layout(rng: random.Random) -> dict[str, WorldPose]:
-    """Sample the same independent cup-position distribution used by evaluation."""
-    return {name: spawn.sample(rng) for name, spawn in CUP_STACKING_EVAL_SPAWNS.items()}
+    """Sample the exact independent cup-position distribution used by evaluation."""
+    return sample_cup_stacking_layout(rng, CUP_STACKING_EVAL_SPAWNS)
+
+
+def sample_cup_stacking_eval_wide_layout(rng: random.Random) -> dict[str, WorldPose]:
+    """Sample the evaluation distribution with a small reach-safe xy margin."""
+    return sample_cup_stacking_layout(rng, CUP_STACKING_EVAL_WIDE_SPAWNS)

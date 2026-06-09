@@ -40,6 +40,21 @@ the same initial positions and `+/- 5 cm` x/y offsets used by evaluation. It
 intentionally ignores the source cup positions, workspace clamp, pair flipping,
 and minimum/maximum cup-distance settings.
 
+For a slightly broader training distribution, use a new dataset repo id and
+replace the profile with:
+
+```bash
+--cup_layout_profile eval_wide
+```
+
+`eval_wide` expands every evaluation x/y edge by 2 cm while staying inside the
+scripted Franka policy's reliable workspace:
+
+| Object | Wide x range | Wide y range |
+|---|---:|---:|
+| `blue_cup` | `0.29` to `0.43` | `-0.47` to `-0.33` |
+| `pink_cup` | `0.39` to `0.53` | `-0.47` to `-0.33` |
+
 Only successful state-machine episodes are exported. Start with 500 successful
 episodes; increase toward 1000 if training and generation time allow.
 

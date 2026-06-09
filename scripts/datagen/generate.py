@@ -126,11 +126,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--cup_layout_profile",
-    choices=("source", "eval"),
+    choices=("source", "eval", "eval_wide"),
     default="source",
     help=(
         "Cup start-pose distribution. 'source' uses object_poses plus the workspace options; "
-        "'eval' ignores those cup positions and samples the fixed cup-stacking evaluation distribution."
+        "'eval' samples the fixed cup-stacking evaluation distribution; 'eval_wide' adds a small "
+        "reach-safe margin around the evaluation distribution."
     ),
 )
 parser.add_argument("--quality", action="store_true", help="Whether to enable quality render mode.")
@@ -168,7 +169,12 @@ from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
 from simulator.datagen.state_machine.cup_stacking import CupStackingStateMachine
 from simulator.datagen.state_machine.cutlery_arrangement import CutleryArrangementStateMachine
 from simulator.datagen.state_machine.toy_blocks_collection import ToyBlocksCollectionStateMachine
-from simulator.utils.cup_stacking_layout import CUP_STACKING_EVAL_SPAWNS, sample_cup_stacking_eval_layout
+from simulator.utils.cup_stacking_layout import (
+    CUP_STACKING_EVAL_SPAWNS,
+    CUP_STACKING_EVAL_WIDE_SPAWNS,
+    sample_cup_stacking_eval_layout,
+    sample_cup_stacking_eval_wide_layout,
+)
 from simulator.utils.object_poses_loader import load_episode_poses
 
 # Maps gym task id → (StateMachineClass, device_type)
@@ -428,6 +434,8 @@ def _prepare_episode_poses(poses, rng, args_cli):
     """Select and randomize the start-pose distribution for one episode."""
     if args_cli.cup_layout_profile == "eval":
         return sample_cup_stacking_eval_layout(rng)
+    if args_cli.cup_layout_profile == "eval_wide":
+        return sample_cup_stacking_eval_wide_layout(rng)
     return _jitter_episode_poses(
         poses,
         rng,
@@ -729,11 +737,18 @@ def main():
         raise ValueError("--cup_workspace_y_range MIN must be less than MAX.")
     if not 0.0 <= args_cli.cup_pair_flip_prob <= 1.0:
         raise ValueError("--cup_pair_flip_prob must be in [0, 1].")
-    if args_cli.cup_layout_profile == "eval":
+    if args_cli.cup_layout_profile in {"eval", "eval_wide"}:
         if task_name != "HCIS-CupStacking-SingleArm-v0":
-            raise ValueError("--cup_layout_profile=eval is only supported for HCIS-CupStacking-SingleArm-v0.")
-        print("[pose] using cup-stacking evaluation-aligned start distribution:")
-        for name, spawn in CUP_STACKING_EVAL_SPAWNS.items():
+            raise ValueError(
+                "--cup_layout_profile=eval or eval_wide is only supported for HCIS-CupStacking-SingleArm-v0."
+            )
+        spawns = (
+            CUP_STACKING_EVAL_SPAWNS
+            if args_cli.cup_layout_profile == "eval"
+            else CUP_STACKING_EVAL_WIDE_SPAWNS
+        )
+        print(f"[pose] using cup-stacking {args_cli.cup_layout_profile} start distribution:")
+        for name, spawn in spawns.items():
             print(f"  [pose] {name}: x={spawn.x_range}, y={spawn.y_range}, z={spawn.center[2]:.3f}")
     if args_cli.sample_cup_layout:
         workspace_width = args_cli.cup_workspace_x_range[1] - args_cli.cup_workspace_x_range[0]
