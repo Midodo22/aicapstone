@@ -307,7 +307,12 @@ def _resolve_lerobot_dataset_dir(args_cli):
     if not args_cli.lerobot_dataset_repo_id:
         return None
     repo_name = args_cli.lerobot_dataset_repo_id.rsplit("/", 1)[-1]
+    hf_home = os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface"))
+    hf_lerobot_home = os.path.expanduser(
+        os.environ.get("HF_LEROBOT_HOME", os.path.join(hf_home, "lerobot"))
+    )
     candidates = [
+        os.path.join(hf_lerobot_home, args_cli.lerobot_dataset_repo_id),
         os.path.join("data", repo_name),
         args_cli.lerobot_dataset_repo_id,
     ]
@@ -327,6 +332,32 @@ def _get_lerobot_episode_count(args_cli):
     with open(info_path) as f:
         info = json.load(f)
     return int(info.get("total_episodes", 0))
+
+
+def _validate_lerobot_resume_dataset(args_cli):
+    """Fail early when an interrupted LeRobot dataset is not safely resumable."""
+    if not (args_cli.record and args_cli.use_lerobot_recorder and args_cli.resume):
+        return
+
+    dataset_dir = _resolve_lerobot_dataset_dir(args_cli)
+    if not dataset_dir or not os.path.isdir(dataset_dir):
+        raise ValueError(
+            "--resume requested, but the local LeRobot dataset directory does not exist: "
+            f"{dataset_dir}"
+        )
+
+    info_path = os.path.join(dataset_dir, "meta", "info.json")
+    episodes_dir = os.path.join(dataset_dir, "meta", "episodes")
+    has_episode_metadata = os.path.isdir(episodes_dir) and any(
+        filename.endswith(".parquet")
+        for _, _, filenames in os.walk(episodes_dir)
+        for filename in filenames
+    )
+    if not os.path.isfile(info_path) or not has_episode_metadata:
+        raise ValueError(
+            f"LeRobot dataset at {dataset_dir} is incomplete and cannot be resumed safely. "
+            "Preserve or remove that directory, then start a clean dataset without --resume."
+        )
 
 
 def _get_resume_recorded_demo_count(env, args_cli):
@@ -725,6 +756,7 @@ def main():
         raise ValueError("--target_demo_count must be a positive integer when provided.")
     if args_cli.target_demo_count is not None and not args_cli.record:
         raise ValueError("--target_demo_count counts recorded successful demos, so it requires --record.")
+    _validate_lerobot_resume_dataset(args_cli)
     if args_cli.samples_per_pose <= 0:
         raise ValueError("--samples_per_pose must be a positive integer.")
     if args_cli.pose_jitter_xy < 0.0:

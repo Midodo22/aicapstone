@@ -58,6 +58,20 @@ demonstrations while covering twice as many layouts. The generator flushes the
 final successful episode before exiting, so `--target_demo_count 1000`
 produces 1000 exported episodes rather than 999.
 
+If generation is interrupted after at least one episode was exported, rerun
+the same command with `--resume`. The generator reads the existing episode
+count from the Hugging Face LeRobot cache and continues until the total reaches
+`--target_demo_count`:
+
+```bash
+--resume \
+--target_demo_count 1000
+```
+
+Use normal `Ctrl+C` cleanup when possible. A forced kill can leave metadata
+incomplete; the generator detects that case before creating the environment
+and requires a clean dataset directory instead of attempting an unsafe resume.
+
 Upload the completed dataset from inside the container:
 
 ```bash
