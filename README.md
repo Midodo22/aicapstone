@@ -159,6 +159,7 @@ See [LeRobot Rollout (Policy Evaluation)](docs/lerobot_rollout.md) for the full 
 | [LeRobot Checkpoint Format](docs/lerobot_model_format.md) | Understanding LeRobot model checkpoint structure |
 | [LeRobot Rollout (Policy Evaluation)](docs/lerobot_rollout.md) | Running trained policies in the simulator |
 | [LeRobot Training Procedure](docs/lerobot_training.md) | Training imitation-learning policies |
+| [Cup Stacking Evaluation Alignment](docs/cup_stacking_eval_alignment.md) | Match cup-stacking generation to the fixed evaluation distribution |
 | [Standalone Env Config Export](docs/standalone_env_config_export.md) | Exporting environment configs as standalone files |
 | [Synthetic Data Generation Pipeline](docs/synthetic_data_generation.md) | Generating synthetic training data |
 | [UMI Pipeline](docs/umi_pipeline.md) | Data collection and processing with UMI |

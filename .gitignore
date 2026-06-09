@@ -34,6 +34,8 @@ dependencies/IsaacLab/**/*.egg-info/
 
 
 datasets/*
+outputs/
+generate_eval_aligned_bundle/
 
 # Private external task files
 private_tasks/*
