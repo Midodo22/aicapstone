@@ -40,6 +40,8 @@ _MAX_ROT_DELTA = 0.08
 _IK_DLS_LAMBDA = 0.01
 
 _HOVER_Z_OFFSET = 0.15
+# The target is the hand origin, so it must stay above the cup root while the
+# fingers surround the cup. Approach and close at this same pose.
 _GRASP_Z_OFFSET = 0.08
 _LIFT_Z_OFFSET = 0.2
 _RELEASE_Z_OFFSET = 0.09
@@ -110,7 +112,19 @@ class CupStackingStateMachine(StateMachineBase):
     returning actions.
     """
 
-    MAX_STEPS: int = 720
+    # The previous 1200-step sequence taught imitation policies long pauses.
+    # Keep every phase long enough for the scripted controller to converge,
+    # while avoiding redundant stationary frames.
+    PHASE_STEPS: tuple[int, ...] = (
+        150,  # Phase 0: Move above the blue cup
+        80,  # Phase 1: Descend to grasp pose with gripper open
+        35,  # Phase 2: Hold pose and close gripper
+        100,  # Phase 3: Lift blue cup upward
+        130,  # Phase 4: Move blue cup above the pink cup
+        70,  # Phase 5: Lower/place above the pink cup
+        40,  # Phase 6: Hold the eval-success stack pose
+    )
+    MAX_STEPS: int = sum(PHASE_STEPS)
 
     def __init__(self) -> None:
         self._step_count: int = 0
@@ -130,15 +144,7 @@ class CupStackingStateMachine(StateMachineBase):
         self._gripper_down_yaw_w: torch.Tensor | None = None
         self._gripper_down_yaw_offset_w: torch.Tensor | None = None
         self._event: int = 0
-        self._events_dt = [
-            350,  # Phase 0: Move above the blue cup
-            160,  # Phase 1: Approach down to the blue cup
-            60,  # Phase 2: Close gripper to grasp
-            200,  # Phase 3: Lift blue cup upward
-            210,  # Phase 4: Move blue cup above the pink cup
-            120,  # Phase 5: Lower/place above the pink cup
-            100,  # Phase 6: Hold the eval-success stack pose
-        ]
+        self._events_dt = list(self.PHASE_STEPS)
 
     # ------------------------------------------------------------------
     # StateMachineBase interface
@@ -245,6 +251,7 @@ class CupStackingStateMachine(StateMachineBase):
 
     def _phase_grasp_blue(self, blue_cup_pos_w, num_envs, device):
         target_pos_w = blue_cup_pos_w.clone()
+        target_pos_w[:, 2] += _GRASP_Z_OFFSET
         return target_pos_w, _constant_gripper(num_envs, device, _GRIPPER_CLOSE)
 
     def _phase_lift_blue(self, blue_cup_pos_w, num_envs, device):

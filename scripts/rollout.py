@@ -119,6 +119,14 @@ parser.add_argument(
     action="store_true",
     help="Print observation and action tensor shapes around each local LeRobot inference call.",
 )
+parser.add_argument(
+    "--disable_act_temporal_ensemble",
+    action="store_true",
+    help=(
+        "Disable ACT temporal ensembling at inference so discrete gripper open/close "
+        "commands are not averaged across predictions."
+    ),
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -288,6 +296,7 @@ class LeRobotSyncPolicy:
         actions_per_chunk: int,
         device: str,
         debug_policy_shapes: bool = False,
+        disable_act_temporal_ensemble: bool = False,
     ):
         if actions_per_chunk <= 0:
             raise ValueError(
@@ -325,6 +334,15 @@ class LeRobotSyncPolicy:
         self.policy = policy_class.from_pretrained(pretrained_name_or_path, local_files_only=True)
         self.policy.to(device)
         self.policy.eval()
+        if disable_act_temporal_ensemble and policy_type == "act":
+            self.policy.config.temporal_ensemble_coeff = None
+            if hasattr(self.policy, "temporal_ensembler"):
+                self.policy.temporal_ensembler = None
+            self.policy.reset()
+            print(
+                "ACT temporal ensembling disabled for crisp gripper transitions.",
+                flush=True,
+            )
 
         device_override = {"device": device}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -512,6 +530,7 @@ def main():
         actions_per_chunk=args_cli.policy_action_horizon,
         device=args_cli.device,
         debug_policy_shapes=args_cli.debug_policy_shapes,
+        disable_act_temporal_ensemble=args_cli.disable_act_temporal_ensemble,
     )
 
     rate_limiter = RateLimiter(args_cli.step_hz)

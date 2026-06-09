@@ -15,6 +15,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 STEPS="${STEPS:-200000}"
 SEED="${SEED:-42}"
 WANDB_ENABLE="${WANDB_ENABLE:-false}"
+ACT_TEMPORAL_ENSEMBLE_COEFF="${ACT_TEMPORAL_ENSEMBLE_COEFF:-}"
 
 if ! command -v lerobot-train >/dev/null 2>&1; then
   echo "lerobot-train not found. Run this on the host after activating the project environment." >&2
@@ -64,8 +65,10 @@ case "$POLICY_TYPE" in
     POLICY_ARGS=(
       "--policy.chunk_size=50"
       "--policy.n_action_steps=1"
-      "--policy.temporal_ensemble_coeff=0.01"
     )
+    if [[ -n "$ACT_TEMPORAL_ENSEMBLE_COEFF" ]]; then
+      POLICY_ARGS+=("--policy.temporal_ensemble_coeff=$ACT_TEMPORAL_ENSEMBLE_COEFF")
+    fi
     ;;
   diffusion)
     POLICY_ARGS=(

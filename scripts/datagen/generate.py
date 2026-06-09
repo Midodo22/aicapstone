@@ -650,6 +650,11 @@ def _on_episode_done(
     else:
         auto_terminate(env, False)
 
+    # Recorder managers export the just-finished episode during reset. Flush
+    # before checking the target count so the final requested demo is not lost
+    # when generation exits immediately after reaching the target.
+    env.reset()
+
     if (
         args_cli.record
         and _get_exported_successful_episode_count(env) + resume_recorded_demo_count
@@ -667,7 +672,6 @@ def _on_episode_done(
             print(f"Replayed all {total_episodes} pose attempts. Exiting the app.")
         return next_pose_idx, attempted_episode_count, current_recorded_demo_count, start_record_state, True, success
 
-    env.reset()
     sm.reset()
     auto_terminate(env, False)
     next_pose_idx = _pose_idx_for_attempt(args_cli, attempted_episode_count, len(episodes))

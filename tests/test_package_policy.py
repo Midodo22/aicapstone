@@ -9,7 +9,15 @@ from scripts.package_policy import package_policy, resolve_pretrained_model
 
 def _write_fake_model(model_dir: Path, policy_type: str = "act") -> None:
     model_dir.mkdir(parents=True)
-    (model_dir / "config.json").write_text(json.dumps({"type": policy_type}))
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "type": policy_type,
+                "n_action_steps": 10,
+                "temporal_ensemble_coeff": 0.01,
+            }
+        )
+    )
     (model_dir / "model.safetensors").write_bytes(b"weights")
     (model_dir / "policy_preprocessor.json").write_text("{}")
     (model_dir / "policy_postprocessor.json").write_text("{}")
@@ -49,3 +57,33 @@ def test_package_policy_rejects_missing_normalization_state(tmp_path):
 
     with pytest.raises(ValueError, match="normalization state"):
         package_policy(model_dir, tmp_path / "my_policy", tmp_path / "my_policy.zip")
+
+
+def test_package_policy_can_make_act_reactive(tmp_path):
+    model_dir = tmp_path / "pretrained_model"
+    _write_fake_model(model_dir)
+    output_dir = tmp_path / "my_policy"
+
+    package_policy(
+        model_dir,
+        output_dir,
+        tmp_path / "my_policy.zip",
+        reactive_act=True,
+    )
+
+    config = json.loads((output_dir / "config.json").read_text())
+    assert config["n_action_steps"] == 1
+    assert config["temporal_ensemble_coeff"] is None
+
+
+def test_reactive_act_rejects_diffusion_checkpoint(tmp_path):
+    model_dir = tmp_path / "pretrained_model"
+    _write_fake_model(model_dir, policy_type="diffusion")
+
+    with pytest.raises(ValueError, match="ACT checkpoint"):
+        package_policy(
+            model_dir,
+            tmp_path / "my_policy",
+            tmp_path / "my_policy.zip",
+            reactive_act=True,
+        )

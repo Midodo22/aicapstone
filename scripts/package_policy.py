@@ -60,10 +60,33 @@ def validate_pretrained_model(model_dir: Path) -> str:
     return policy_type
 
 
-def package_policy(source: Path, output_dir: Path, zip_path: Path, force: bool = False) -> tuple[str, Path]:
+def make_act_reactive(model_dir: Path, policy_type: str) -> None:
+    """Configure a packaged ACT policy to replan every step without action averaging."""
+    if policy_type != "act":
+        raise ValueError("--reactive-act can only be applied to an ACT checkpoint.")
+
+    config_path = model_dir / "config.json"
+    with config_path.open() as file:
+        config = json.load(file)
+    config["n_action_steps"] = 1
+    config["temporal_ensemble_coeff"] = None
+    with config_path.open("w") as file:
+        json.dump(config, file, indent=2, sort_keys=True)
+        file.write("\n")
+
+
+def package_policy(
+    source: Path,
+    output_dir: Path,
+    zip_path: Path,
+    force: bool = False,
+    reactive_act: bool = False,
+) -> tuple[str, Path]:
     """Copy a validated checkpoint to output_dir and create a zip containing output_dir as its root."""
     model_dir = resolve_pretrained_model(source)
     policy_type = validate_pretrained_model(model_dir)
+    if reactive_act and policy_type != "act":
+        raise ValueError("--reactive-act can only be applied to an ACT checkpoint.")
 
     if output_dir.exists():
         if not force:
@@ -71,6 +94,8 @@ def package_policy(source: Path, output_dir: Path, zip_path: Path, force: bool =
         shutil.rmtree(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(model_dir, output_dir)
+    if reactive_act:
+        make_act_reactive(output_dir, policy_type)
 
     if zip_path.exists():
         if not force:
@@ -91,9 +116,23 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/my_policy"))
     parser.add_argument("--zip-path", type=Path, default=Path("checkpoints/my_policy.zip"))
     parser.add_argument("--force", action="store_true", help="Replace an existing output directory and zip.")
+    parser.add_argument(
+        "--reactive-act",
+        action="store_true",
+        help=(
+            "Package ACT with n_action_steps=1 and temporal ensembling disabled. "
+            "This prevents delayed gripper transitions and makes the checkpoint replan every step."
+        ),
+    )
     args = parser.parse_args()
 
-    policy_type, zip_path = package_policy(args.source, args.output_dir, args.zip_path, args.force)
+    policy_type, zip_path = package_policy(
+        args.source,
+        args.output_dir,
+        args.zip_path,
+        args.force,
+        args.reactive_act,
+    )
     print(f"Packaged {policy_type} policy: {zip_path}")
 
 
