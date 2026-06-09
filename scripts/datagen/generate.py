@@ -124,6 +124,15 @@ parser.add_argument(
     action="store_true",
     help="Sample cup center, distance, and angle uniformly inside the safe workspace instead of clamping raw poses.",
 )
+parser.add_argument(
+    "--cup_layout_profile",
+    choices=("source", "eval"),
+    default="source",
+    help=(
+        "Cup start-pose distribution. 'source' uses object_poses plus the workspace options; "
+        "'eval' ignores those cup positions and samples the fixed cup-stacking evaluation distribution."
+    ),
+)
 parser.add_argument("--quality", action="store_true", help="Whether to enable quality render mode.")
 parser.add_argument("--use_lerobot_recorder", action="store_true", help="Whether to use lerobot recorder.")
 parser.add_argument("--lerobot_dataset_repo_id", type=str, default=None, help="Lerobot Dataset repository ID.")
@@ -159,6 +168,7 @@ from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
 from simulator.datagen.state_machine.cup_stacking import CupStackingStateMachine
 from simulator.datagen.state_machine.cutlery_arrangement import CutleryArrangementStateMachine
 from simulator.datagen.state_machine.toy_blocks_collection import ToyBlocksCollectionStateMachine
+from simulator.utils.cup_stacking_layout import CUP_STACKING_EVAL_SPAWNS, sample_cup_stacking_eval_layout
 from simulator.utils.object_poses_loader import load_episode_poses
 
 # Maps gym task id → (StateMachineClass, device_type)
@@ -414,6 +424,20 @@ def _jitter_episode_poses(
     return jittered
 
 
+def _prepare_episode_poses(poses, rng, args_cli):
+    """Select and randomize the start-pose distribution for one episode."""
+    if args_cli.cup_layout_profile == "eval":
+        return sample_cup_stacking_eval_layout(rng)
+    return _jitter_episode_poses(
+        poses,
+        rng,
+        args_cli,
+        args_cli.pose_jitter_xy,
+        math.radians(args_cli.pose_jitter_yaw_deg),
+        args_cli.min_cup_distance,
+    )
+
+
 def _regularize_cup_stacking_poses(poses, rng, args_cli):
     """Keep cup starts in the reliable workspace of the scripted IK policy."""
     blue_pos, blue_quat = poses["blue_cup"]
@@ -477,14 +501,7 @@ def _regularize_cup_stacking_poses(poses, rng, args_cli):
 def _apply_episode_poses(env, poses, args_cli, episode_seed: int):
     """Write per-object root poses for the current episode into the sim."""
     rng = random.Random(episode_seed)
-    poses = _jitter_episode_poses(
-        poses,
-        rng,
-        args_cli,
-        args_cli.pose_jitter_xy,
-        math.radians(args_cli.pose_jitter_yaw_deg),
-        args_cli.min_cup_distance,
-    )
+    poses = _prepare_episode_poses(poses, rng, args_cli)
 
     device = env.device
     for name, (pos, quat) in poses.items():
@@ -712,6 +729,12 @@ def main():
         raise ValueError("--cup_workspace_y_range MIN must be less than MAX.")
     if not 0.0 <= args_cli.cup_pair_flip_prob <= 1.0:
         raise ValueError("--cup_pair_flip_prob must be in [0, 1].")
+    if args_cli.cup_layout_profile == "eval":
+        if task_name != "HCIS-CupStacking-SingleArm-v0":
+            raise ValueError("--cup_layout_profile=eval is only supported for HCIS-CupStacking-SingleArm-v0.")
+        print("[pose] using cup-stacking evaluation-aligned start distribution:")
+        for name, spawn in CUP_STACKING_EVAL_SPAWNS.items():
+            print(f"  [pose] {name}: x={spawn.x_range}, y={spawn.y_range}, z={spawn.center[2]:.3f}")
     if args_cli.sample_cup_layout:
         workspace_width = args_cli.cup_workspace_x_range[1] - args_cli.cup_workspace_x_range[0]
         workspace_depth = args_cli.cup_workspace_y_range[1] - args_cli.cup_workspace_y_range[0]
